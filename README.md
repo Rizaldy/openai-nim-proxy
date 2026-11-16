@@ -104,3 +104,58 @@ curl http://localhost:3000/v1/chat/completions \
 - Start command: `npm start`
 - Add `NIM_API_KEY` as an env var
 - Free tier sleeps on idle, so do not use free for always-on chat proxy
+
+## Multiple providers on one Vercel deployment
+
+The same deployment serves independent routes; no second Vercel project is needed:
+
+| Provider | Client base URL | Chat completion path |
+| --- | --- | --- |
+| NVIDIA (existing) | `https://openai-nim-proxy-roan-theta.vercel.app/v1` | `/v1/chat/completions` |
+| Numes | `https://openai-nim-proxy-roan-theta.vercel.app/numes/v1` | `/numes/v1/chat/completions` |
+
+Each base URL also supports `/models`. The original NVIDIA aliases and request
+settings remain in place. Numes requires an explicit model ID from its model
+list, forwards that ID unchanged, and does not inject NVIDIA thinking defaults.
+Numes request extensions (including `reasoning`) are forwarded; SDK-style
+`extra_body` is flattened with top-level fields taking precedence.
+
+To enable Numes:
+
+1. Add `NUMES_API_KEY` to the Vercel project's environment variables for the
+   intended deployment environment. Keep `NIM_API_KEY` for NVIDIA.
+2. Optionally set `NUMES_API_BASE=https://api.numes.ai/api/v1` (the default).
+   Use the base URL, without `/chat/completions`.
+3. Deploy these code changes and redeploy after changing environment variables.
+4. Check `/health`: `providers.numes.has_api_key` confirms configuration, not
+   upstream connectivity. Fetch `/numes/v1/models` to check actual access.
+5. Set your client's Numes base URL from the table, or its full chat completion
+   URL if it asks for an endpoint. Select an exact ID from the returned models.
+
+```bash
+curl https://openai-nim-proxy-roan-theta.vercel.app/numes/v1/models
+
+# Replace MODEL_ID with an ID from the model list.
+curl https://openai-nim-proxy-roan-theta.vercel.app/numes/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"Hello"}],"max_tokens":100,"stream":true}'
+```
+
+`SHOW_REASONING` applies to both providers: NVIDIA's `reasoning_content` and
+Numes's plain `reasoning` text become `<think>` blocks. Structured
+`reasoning_details` are preserved, including opaque state; they are not rendered
+as text. The proxy does not force reasoning on for Numes.
+See [Numes reasoning documentation](https://numes.ai/docs/features/reasoning).
+
+Non-success upstream responses preserve their HTTP status and JSON errors;
+non-JSON errors receive a concise JSON wrapper, including for streaming requests.
+A successful curl from your computer does not establish access from Vercel;
+the deployed models and completion checks verify that network path.
+
+Additional OpenAI-compatible providers can be registered in `PROVIDERS` in
+`server.js` with a unique prefix, base URL and separate server-side key. Shared
+handlers register chat and model routes. Providers with different request or
+response formats need their own adapter policy, as NVIDIA has here.
+
+These routes retain the existing proxy's unauthenticated client access: upstream
+keys stay on the server, but anyone who can reach the routes can use them.

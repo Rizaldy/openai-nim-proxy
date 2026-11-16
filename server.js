@@ -3,6 +3,7 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const { StringDecoder } = require('string_decoder');
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -35,6 +36,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const NIM_API_BASE = (process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
 const NIM_API_KEY = process.env.NIM_API_KEY;
+// Each provider gets its own URL, credentials, and request policy.
+const PROVIDERS = {
+  nim: { base: NIM_API_BASE, key: NIM_API_KEY, prefix: '/v1' },
+  numes: {
+    base: (process.env.NUMES_API_BASE || 'https://api.numes.ai/api/v1').replace(/\/$/, ''),
+    key: process.env.NUMES_API_KEY,
+    prefix: '/numes/v1'
+  }
+};
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 120000);
 const DEBUG = String(process.env.DEBUG || 'false').toLowerCase() === 'true';
 
@@ -183,12 +193,17 @@ function pickChatBody(body, upstreamModel) {
   return ensureReasoningSettings(out, upstreamModel);
 }
 
+function visibleReasoning(message) {
+  return typeof message.reasoning_content === 'string' ? message.reasoning_content
+    : typeof message.reasoning === 'string' ? message.reasoning : '';
+}
+
 function mergeReasoningIntoContent(message) {
   if (!message || typeof message !== 'object') return message;
 
   const cloned = { ...message };
   const content = typeof cloned.content === 'string' ? cloned.content : '';
-  const reasoning = typeof cloned.reasoning_content === 'string' ? cloned.reasoning_content : '';
+  const reasoning = visibleReasoning(cloned);
 
   if (SHOW_REASONING && reasoning) {
     cloned.content = `<think>\n${reasoning}\n</think>${content ? `\n\n${content}` : ''}`;
@@ -197,6 +212,7 @@ function mergeReasoningIntoContent(message) {
   }
 
   delete cloned.reasoning_content;
+  delete cloned.reasoning;
   return cloned;
 }
 
@@ -225,7 +241,11 @@ function createStreamState() {
 function reasoningChunkToContent(delta, state, choiceIndex) {
   if (!delta || typeof delta !== 'object') return null;
 
-  const reasoning = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '';
+  if (typeof delta.reasoning === 'string' && typeof delta.reasoning_content !== 'string') {
+    delta.reasoning_content = delta.reasoning;
+  }
+  delete delta.reasoning;
+  const reasoning = visibleReasoning(delta);
   const content = typeof delta.content === 'string' ? delta.content : '';
 
   if (!SHOW_REASONING) {
@@ -282,11 +302,11 @@ function reasoningChunkToContent(delta, state, choiceIndex) {
 }
 
 function transformStreamingEvent(rawLine, state, requestedModel) {
-  if (!rawLine.startsWith('data: ')) {
+  if (!rawLine.startsWith('data:')) {
     return `${rawLine}\n`;
   }
 
-  const payloadText = rawLine.slice(6).trim();
+  const payloadText = rawLine.slice(5).trim();
   if (payloadText === '[DONE]') {
     return 'data: [DONE]\n\n';
   }
@@ -306,6 +326,10 @@ function transformStreamingEvent(rawLine, state, requestedModel) {
       const choiceIndex = nextChoice.index ?? index;
       if (nextChoice.delta) {
         nextChoice.delta = reasoningChunkToContent({ ...nextChoice.delta }, state, choiceIndex);
+      }
+      if (nextChoice.finish_reason && state.reasoningStarted.get(choiceIndex) && !state.reasoningClosed.get(choiceIndex)) {
+        nextChoice.delta = { ...nextChoice.delta, content: `${nextChoice.delta?.content || ''}\n</think>` };
+        state.reasoningClosed.set(choiceIndex, true);
       }
       return nextChoice;
     });
@@ -345,7 +369,7 @@ app.get('/', (_req, res) => {
     ok: true,
     show_reasoning: SHOW_REASONING,
     enable_thinking_mode: ENABLE_THINKING_MODE,
-    endpoints: ['/health', '/v1/models', '/v1/chat/completions']
+    endpoints: ['/health', ...Object.values(PROVIDERS).flatMap(p => [`${p.prefix}/models`, `${p.prefix}/chat/completions`])]
   });
 });
 
@@ -355,6 +379,7 @@ app.get('/health', (_req, res) => {
     service: 'nim-openai-proxy',
     upstream: NIM_API_BASE,
     has_api_key: Boolean(NIM_API_KEY),
+    providers: Object.fromEntries(Object.entries(PROVIDERS).map(([name, p]) => [name, { upstream: p.base, has_api_key: Boolean(p.key), base_path: p.prefix }])),
     glm_5_3_defaults: { clear_thinking: CLEAR_THINKING, reasoning_effort: REASONING_EFFORT },
     show_reasoning: SHOW_REASONING,
     enable_thinking_mode: ENABLE_THINKING_MODE
@@ -382,90 +407,146 @@ app.get('/v1/models', async (_req, res) => {
   });
 });
 
-app.post('/v1/chat/completions', async (req, res) => {
-  const requestedModel = req.body?.model || 'gpt-4o';
-  const upstreamModel = resolveModel(requestedModel);
-  const stream = Boolean(req.body?.stream);
+function chatHandler(providerName) {
+  const provider = PROVIDERS[providerName];
+  return async (req, res) => {
+    const requestedModel = req.body?.model || (providerName === 'nim' ? 'gpt-4o' : undefined);
+    if (typeof requestedModel !== 'string' || !requestedModel.trim()) {
+      return res.status(400).json(buildError(400, 'model must be a non-empty provider model ID'));
+    }
+    if (!provider.key) {
+      return res.status(503).json(buildError(503, `${providerName} API key is not configured`));
+    }
+    const upstreamModel = providerName === 'nim' ? resolveModel(requestedModel) : requestedModel;
+    const stream = Boolean(req.body?.stream);
 
-  if (!Array.isArray(req.body?.messages)) {
-    return res.status(400).json(buildError(400, 'messages must be an array'));
-  }
-
-  const upstreamBody = {
-    model: upstreamModel,
-    ...pickChatBody(req.body, upstreamModel)
-  };
-
-  if (DEBUG) {
-    console.log('chat request', {
-      requestedModel,
-      upstreamModel,
-      stream,
-      messageCount: req.body.messages.length,
-      show_reasoning: SHOW_REASONING,
-      enable_thinking_mode: ENABLE_THINKING_MODE
-    });
-  }
-
-  try {
-    const response = await axios({
-      method: 'post',
-      url: `${NIM_API_BASE}/chat/completions`,
-      data: upstreamBody,
-      timeout: REQUEST_TIMEOUT_MS,
-      responseType: stream ? 'stream' : 'json',
-      headers: {
-        Authorization: `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      validateStatus: () => true
-    });
-
-    if (stream) {
-      res.status(response.status);
-      res.setHeader('Content-Type', response.headers['content-type'] || 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      const state = createStreamState();
-      let buffer = '';
-
-      response.data.on('data', (chunk) => {
-        buffer += chunk.toString('utf8');
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          res.write(transformStreamingEvent(line, state, requestedModel));
-        }
-      });
-
-      response.data.on('end', () => {
-        if (buffer.trim()) {
-          res.write(transformStreamingEvent(buffer.trim(), state, requestedModel));
-        }
-        res.end();
-      });
-
-      response.data.on('error', (err) => {
-        console.error('stream error:', err.message);
-        res.end();
-      });
-      return;
+    if (!Array.isArray(req.body?.messages)) {
+      return res.status(400).json(buildError(400, 'messages must be an array'));
     }
 
-    const payload = transformNonStreamingPayload(response.data, requestedModel);
-    return res.status(response.status).json(payload);
-  } catch (error) {
-    console.error('proxy error:', error.message);
+    // Numes accepts OpenAI/OpenRouter extensions; flatten SDK extra_body without
+    // injecting NIM defaults. Keep the route-selected model authoritative.
+    const upstreamBody = providerName === 'nim'
+      ? { model: upstreamModel, ...pickChatBody(req.body, upstreamModel) }
+      : { ...clone(req.body.extra_body || {}), ...clone(req.body), model: upstreamModel };
+    if (providerName !== 'nim') delete upstreamBody.extra_body;
 
-    const status = error.response?.status || 500;
-    const upstreamMessage = error.response?.data?.error?.message || error.message || 'Internal server error';
+    if (DEBUG) {
+      console.log('chat request', {
+        requestedModel,
+        upstreamModel,
+        stream,
+        messageCount: req.body.messages.length,
+        show_reasoning: SHOW_REASONING,
+        enable_thinking_mode: ENABLE_THINKING_MODE
+      });
+    }
 
-    return res.status(status).json(buildError(status, upstreamMessage));
-  }
-});
+    try {
+      const response = await axios({
+        method: 'post',
+        url: `${provider.base}/chat/completions`,
+        data: upstreamBody,
+        timeout: REQUEST_TIMEOUT_MS,
+        responseType: stream ? 'stream' : 'json',
+        headers: {
+          Authorization: `Bearer ${provider.key}`,
+          'Content-Type': 'application/json'
+        },
+        validateStatus: () => true
+      });
+
+      if (response.status < 200 || response.status >= 300) {
+        let data = response.data;
+        if (stream) {
+          const chunks = [];
+          let size = 0;
+          for await (const chunk of data) {
+            size += Buffer.byteLength(chunk);
+            if (size > 1024 * 1024) break;
+            chunks.push(Buffer.from(chunk));
+          }
+          data = Buffer.concat(chunks).toString('utf8');
+          try { data = JSON.parse(data); } catch {}
+        }
+        return res.status(response.status).json(upstreamError(response.status, data, providerName));
+      }
+
+      if (stream) {
+        res.status(response.status);
+        res.setHeader('Content-Type', response.headers['content-type'] || 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const state = createStreamState();
+        let buffer = '';
+        const decoder = new StringDecoder('utf8');
+        res.on?.('close', () => response.data.destroy());
+
+        response.data.on('data', (chunk) => {
+          buffer += decoder.write(chunk);
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            res.write(transformStreamingEvent(line, state, requestedModel));
+          }
+        });
+
+        response.data.on('end', () => {
+          buffer += decoder.end();
+          if (buffer.trim()) {
+            res.write(transformStreamingEvent(buffer.trim(), state, requestedModel));
+          }
+          res.end();
+        });
+
+        response.data.on('error', (err) => {
+          console.error('stream error:', err.message);
+          res.end();
+        });
+        return;
+      }
+
+      const payload = transformNonStreamingPayload(response.data, requestedModel);
+      return res.status(response.status).json(payload);
+    } catch (error) {
+      console.error('proxy error:', error.message);
+
+      const status = error.response?.status || 500;
+      const upstreamMessage = error.response?.data?.error?.message || error.message || 'Internal server error';
+
+      return res.status(status).json(buildError(status, upstreamMessage));
+    }
+  };
+}
+
+function upstreamError(status, data, providerName) {
+  if (data && typeof data === 'object' && data.error) return data;
+  return buildError(status, `${providerName} upstream returned HTTP ${status}`, { type: 'upstream_error' });
+}
+
+for (const [name, provider] of Object.entries(PROVIDERS)) {
+  app.post(`${provider.prefix}/chat/completions`, chatHandler(name));
+  if (name === 'nim') continue; // Preserve NIM's model aliases and discovery.
+  app.get(`${provider.prefix}/models`, async (_req, res) => {
+    if (!provider.key) return res.status(503).json(buildError(503, `${name} API key is not configured`));
+    try {
+      const response = await axios.get(`${provider.base}/models`, {
+        headers: { Authorization: `Bearer ${provider.key}` },
+        timeout: Math.min(REQUEST_TIMEOUT_MS, 15000),
+        validateStatus: () => true
+      });
+      if (response.status < 200 || response.status >= 300) {
+        return res.status(response.status).json(upstreamError(response.status, response.data, name));
+      }
+      return res.status(response.status).json(response.data);
+    } catch (error) {
+      return res.status(502).json(buildError(502, error.message, { type: 'upstream_error' }));
+    }
+  });
+}
 
 app.use((req, res) => {
   res.status(404).json(buildError(404, `Endpoint ${req.method} ${req.path} not found`));

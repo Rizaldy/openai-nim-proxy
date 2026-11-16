@@ -4,19 +4,24 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-function load(env = {}) {
+function load(env = {}, upstreamResponse) {
   const routes = {};
-  const app = { use() {}, get() {}, post(p, handler) { routes[p] = handler; }, listen() {} };
+  const app = { use() {}, get(p, handler) { routes[p] = handler; }, post(p, handler) { routes[p] = handler; }, listen() {} };
   const express = () => app;
   express.json = () => () => {};
   let sent;
+  let optionsSent;
   const axios = async (options) => {
-    sent = JSON.parse(JSON.stringify(options.data));
+    optionsSent = options;
+    sent = options.data && JSON.parse(JSON.stringify(options.data));
+    if (upstreamResponse) return upstreamResponse;
     return { status: 200, data: { choices: [{ message: {
       content: 'Answer', reasoning_content: 'Reasoning'
     } }] } };
   };
+  axios.get = (url, options) => axios({ url, ...options });
   const context = vm.createContext({
+    Buffer,
     require(name) {
       if (name === 'fs') return { existsSync: () => false };
       if (name === 'express') return express;
@@ -31,12 +36,21 @@ function load(env = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8'), context);
   return {
     context,
-    async request(body) {
+    async request(body, route = '/v1/chat/completions') {
       let result;
-      await routes['/v1/chat/completions']({ body: {
+      let status;
+      let output = '';
+      let done;
+      const ended = new Promise(resolve => { done = resolve; });
+      await routes[route]({ body: {
         model: 'z-ai/glm-5.3', messages: [{ role: 'user', content: 'Hello' }], ...body
-      } }, { status() { return this; }, json(value) { result = value; } });
-      return { sent, result };
+      } }, {
+        status(value) { status = value; return this; },
+        json(value) { result = value; },
+        setHeader() {}, write(value) { output += value; }, end() { done(); }
+      });
+      if (body.stream && status === 200) await ended;
+      return { sent, result, status, output, options: optionsSent };
     }
   };
 }
@@ -90,4 +104,81 @@ test('streamed reasoning stays visible', () => {
       + reasoningChunkToContent({content:'Answer'}, state, 0).content;
   })()`, context);
   assert.equal(output, '<think>\nReasoning\n</think>\n\nAnswer');
+});
+
+const numesRoute = '/numes/v1/chat/completions';
+
+test('Numes uses its own URL/key, keeps model IDs and does not inject NIM defaults', async () => {
+  const { sent, options, status } = await load({ NUMES_API_KEY: 'numes-test' }).request({
+    model: 'gpt-4o', reasoning: { effort: 'high' },
+    extra_body: { model: 'wrong', temperature: 0.2 }, temperature: 0.5
+  }, numesRoute);
+  assert.equal(status, 200);
+  assert.equal(options.url, 'https://api.numes.ai/api/v1/chat/completions');
+  assert.equal(options.headers.Authorization, 'Bearer numes-test');
+  assert.equal(sent.model, 'gpt-4o');
+  assert.equal(sent.temperature, 0.5);
+  assert.deepEqual(sent.reasoning, { effort: 'high' });
+  assert.equal(sent.extra_body, undefined);
+  assert.equal(sent.chat_template_kwargs, undefined);
+  assert.equal(sent.reasoning_effort, undefined);
+});
+
+test('Numes requires configuration and an explicit model', async () => {
+  assert.equal((await load().request({}, numesRoute)).status, 503);
+  assert.equal((await load({ NUMES_API_KEY: 'test' }).request({ model: undefined }, numesRoute)).status, 400);
+});
+
+test('Numes model discovery uses its own provider', async () => {
+  const response = { status: 200, data: { data: [{ id: 'provider/model' }] } };
+  const { result, options } = await load({ NUMES_API_KEY: 'test' }, response).request({}, '/numes/v1/models');
+  assert.deepEqual(result, response.data);
+  assert.equal(options.url, 'https://api.numes.ai/api/v1/models');
+  assert.equal(options.headers.Authorization, 'Bearer test');
+});
+
+test('Numes reasoning is displayed, with opaque details preserved', async () => {
+  const details = [{ type: 'reasoning.encrypted', data: 'opaque' }];
+  const response = { status: 200, data: { choices: [{ message: {
+    content: 'Answer', reasoning: 'Thought', reasoning_details: details
+  } }] } };
+  for (const show of ['true', 'false']) {
+    const { result } = await load({ NUMES_API_KEY: 'test', SHOW_REASONING: show }, response).request({}, numesRoute);
+    const message = result.choices[0].message;
+    assert.equal(message.content, show === 'true' ? '<think>\nThought\n</think>\n\nAnswer' : 'Answer');
+    assert.equal(message.reasoning, undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(message.reasoning_details)), details);
+  }
+});
+
+test('upstream errors remain JSON, including streaming HTML 403 responses', async () => {
+  const { Readable } = require('node:stream');
+  const response = { status: 403, data: Readable.from(['<html>Challenge</html>']) };
+  const result = await load({ NUMES_API_KEY: 'test' }, response).request({ stream: true }, numesRoute);
+  assert.equal(result.status, 403);
+  assert.equal(result.result.error.type, 'upstream_error');
+  const jsonError = { status: 429, data: { error: { message: 'Rate limited', code: 429 } } };
+  assert.deepEqual((await load({ NUMES_API_KEY: 'test' }, jsonError).request({}, numesRoute)).result, jsonError.data);
+});
+
+test('Numes SSE handles split UTF-8 and closes reasoning on finish', async () => {
+  const { Readable } = require('node:stream');
+  const bytes = Buffer.from('data:{"choices":[{"index":0,"delta":{"reasoning":"考"}}]}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  const split = bytes.indexOf(Buffer.from('考')) + 1;
+  const response = { status: 200, headers: { 'content-type': 'text/event-stream' },
+    data: Readable.from([bytes.subarray(0, split), bytes.subarray(split)]) };
+  const { output } = await load({ NUMES_API_KEY: 'test' }, response).request({ stream: true }, numesRoute);
+  const events = output.split('\n').filter(line => line.startsWith('data: ') && !line.includes('[DONE]')).map(line => JSON.parse(line.slice(6)));
+  assert.equal(events.map(event => event.choices[0].delta.content).join(''), '<think>\n考\n</think>');
+  assert.ok(output.endsWith('data: [DONE]\n\n'));
+});
+
+
+test('NIM model discovery retains its key and aliases', async () => {
+  const response = { status: 200, data: { data: [{ id: 'nim/raw-model' }] } };
+  const { result, options } = await load({}, response).request({}, '/v1/models');
+  assert.equal(options.url, 'https://integrate.api.nvidia.com/v1/models');
+  assert.equal(options.headers.Authorization, 'Bearer test');
+  assert.ok(result.data.some(model => model.id === 'nim/raw-model'));
+  assert.ok(result.data.some(model => model.id === 'gpt-4o'));
 });
