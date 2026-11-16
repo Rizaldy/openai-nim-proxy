@@ -161,3 +161,20 @@ response formats need their own adapter policy, as NVIDIA has here.
 
 These routes retain the existing proxy's unauthenticated client access: upstream
 keys stay on the server, but anyone who can reach the routes can use them.
+
+### Reasoning effort for Numes GLM variants
+
+For `dealignai/glm-5.3-flash-uncensored-fp8` and
+`dealignai/glm-5.3-uncensored-fp8`, the proxy sends `reasoning.effort` using
+`NUMES_REASONING_EFFORT`, falling back to `REASONING_EFFORT`, then `high`.
+Values are `low`, `high`, or `max` (case-insensitive in environment variables).
+Other Numes models receive no automatic reasoning settings.
+
+Explicit request `reasoning.effort`, `reasoning_effort`, budgets, or disable
+settings take precedence and are passed to Numes for validation. These models
+currently advertise mandatory reasoning and no separate reasoning token budget.
+`SHOW_REASONING` controls display only. Effort does not promise a particular
+length of visible reasoning; output limits can also constrain the response.
+Redeploy after editing Vercel variables; `/health` → `numes_glm_defaults` shows
+the active default. Both models advertise `high` as their upstream default, so
+changing an unset setting to `high` may have no visible effect.

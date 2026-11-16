@@ -58,6 +58,30 @@ const REASONING_EFFORT = String(process.env.REASONING_EFFORT || 'low').trim().to
 if (!['low', 'high', 'max'].includes(REASONING_EFFORT)) {
   throw new Error('REASONING_EFFORT must be low, high, or max');
 }
+const NUMES_GLM_MODELS = new Set([
+  'dealignai/glm-5.3-flash-uncensored-fp8',
+  'dealignai/glm-5.3-uncensored-fp8'
+]);
+const NUMES_REASONING_EFFORT = String(
+  process.env.NUMES_REASONING_EFFORT || process.env.REASONING_EFFORT || 'high'
+).trim().toLowerCase();
+if (!['low', 'high', 'max'].includes(NUMES_REASONING_EFFORT)) {
+  throw new Error('NUMES_REASONING_EFFORT must be low, high, or max');
+}
+
+function applyNumesReasoningDefaults(body) {
+  if (!NUMES_GLM_MODELS.has(body.model)) return body;
+  // Explicit client effort/budget/disable settings take precedence over env.
+  if (body.reasoning_effort !== undefined) return body;
+  if (body.reasoning !== undefined && (
+    !body.reasoning || typeof body.reasoning !== 'object' || Array.isArray(body.reasoning)
+    || body.reasoning.effort !== undefined || body.reasoning.max_tokens !== undefined
+    || body.reasoning.enabled === false
+  )) return body;
+  body.reasoning = { ...body.reasoning, effort: NUMES_REASONING_EFFORT };
+  return body;
+}
+
 const INCLUDE_RAW_NIM_MODELS = String(process.env.INCLUDE_RAW_NIM_MODELS || 'true').toLowerCase() === 'true';
 
 if (!NIM_API_KEY) {
@@ -384,6 +408,7 @@ app.get('/health', (_req, res) => {
     upstream: NIM_API_BASE,
     has_api_key: Boolean(NIM_API_KEY),
     providers: Object.fromEntries(Object.entries(PROVIDERS).map(([name, p]) => [name, { upstream: p.base, has_api_key: Boolean(p.key), base_path: p.prefix }])),
+    numes_glm_defaults: { models: [...NUMES_GLM_MODELS], reasoning: { effort: NUMES_REASONING_EFFORT } },
     glm_5_3_defaults: { clear_thinking: CLEAR_THINKING, reasoning_effort: REASONING_EFFORT },
     show_reasoning: SHOW_REASONING,
     enable_thinking_mode: ENABLE_THINKING_MODE
@@ -433,7 +458,10 @@ function chatHandler(providerName) {
     const upstreamBody = providerName === 'nim'
       ? { model: upstreamModel, ...pickChatBody(req.body, upstreamModel) }
       : { ...clone(req.body.extra_body || {}), ...clone(req.body), model: upstreamModel };
-    if (providerName !== 'nim') delete upstreamBody.extra_body;
+    if (providerName !== 'nim') {
+      delete upstreamBody.extra_body;
+      applyNumesReasoningDefaults(upstreamBody);
+    }
 
     if (DEBUG) {
       console.log('chat request', {

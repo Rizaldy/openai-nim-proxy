@@ -210,3 +210,23 @@ test('Janitor responses expose reasoning only once, including when hidden', asyn
     assert.equal(deltas.map(d => d.content || '').join(''), show === 'true' ? '<think>\nThe thought\n</think>\n\nAnswer' : 'Answer');
   }
 });
+
+
+test('both Numes GLM variants use env reasoning defaults with request overrides', async () => {
+  for (const model of ['dealignai/glm-5.3-flash-uncensored-fp8', 'dealignai/glm-5.3-uncensored-fp8']) {
+    const env = { NUMES_API_KEY: 'test', REASONING_EFFORT: 'High' };
+    const request = body => load(env).request({ model, ...body }, numesRoute);
+    assert.deepEqual((await request({})).sent.reasoning, { effort: 'high' });
+    assert.deepEqual((await load({ NUMES_API_KEY: 'test' }).request({ model }, numesRoute)).sent.reasoning, { effort: 'high' });
+    assert.deepEqual((await load({ ...env, NUMES_REASONING_EFFORT: 'Max' }).request({ model }, numesRoute)).sent.reasoning, { effort: 'max' });
+    for (const reasoning of [{ effort: 'low' }, { max_tokens: 1024 }, { enabled: false }, null]) {
+      assert.deepEqual((await request({ reasoning })).sent.reasoning, reasoning);
+    }
+    assert.deepEqual((await request({ reasoning: { exclude: true } })).sent.reasoning, { exclude: true, effort: 'high' });
+    const explicit = await request({ extra_body: { reasoning_effort: 'low' } });
+    assert.equal(explicit.sent.reasoning_effort, 'low');
+    assert.equal(explicit.sent.reasoning, undefined);
+    assert.deepEqual((await request({ extra_body: { reasoning: { effort: 'max' } } })).sent.reasoning, { effort: 'max' });
+  }
+  assert.throws(() => load({ NUMES_REASONING_EFFORT: 'invalid' }), /NUMES_REASONING_EFFORT/);
+});
