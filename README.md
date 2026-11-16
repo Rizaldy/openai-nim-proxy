@@ -143,8 +143,10 @@ curl https://openai-nim-proxy-roan-theta.vercel.app/numes/v1/chat/completions \
 
 `SHOW_REASONING` applies to both providers: NVIDIA's `reasoning_content` and
 Numes's plain `reasoning` text become `<think>` blocks. Structured
-`reasoning_details` are preserved, including opaque state; they are not rendered
-as text. The proxy does not force reasoning on for Numes.
+`reasoning_details` are omitted by default so clients such as Janitor AI do not
+render the same reasoning twice. Set `PRESERVE_REASONING_DETAILS=true` only for
+clients that need structured/signed reasoning state for subsequent turns; such
+clients must avoid displaying both that field and the `<think>` content. The proxy does not force reasoning on for Numes.
 See [Numes reasoning documentation](https://numes.ai/docs/features/reasoning).
 
 Non-success upstream responses preserve their HTTP status and JSON errors;

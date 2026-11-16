@@ -49,6 +49,8 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 120000);
 const DEBUG = String(process.env.DEBUG || 'false').toLowerCase() === 'true';
 
 // Janitor / SillyTavern friendly toggles
+// Content-only clients may render structured reasoning a second time.
+const PRESERVE_REASONING_DETAILS = String(process.env.PRESERVE_REASONING_DETAILS || 'false').toLowerCase() === 'true';
 const SHOW_REASONING = String(process.env.SHOW_REASONING || 'true').toLowerCase() === 'true';
 const ENABLE_THINKING_MODE = String(process.env.ENABLE_THINKING_MODE || 'true').toLowerCase() === 'true';
 const CLEAR_THINKING = String(process.env.CLEAR_THINKING || 'true').toLowerCase() === 'true';
@@ -213,6 +215,7 @@ function mergeReasoningIntoContent(message) {
 
   delete cloned.reasoning_content;
   delete cloned.reasoning;
+  if (!PRESERVE_REASONING_DETAILS) delete cloned.reasoning_details;
   return cloned;
 }
 
@@ -245,6 +248,7 @@ function reasoningChunkToContent(delta, state, choiceIndex) {
     delta.reasoning_content = delta.reasoning;
   }
   delete delta.reasoning;
+  if (!PRESERVE_REASONING_DETAILS) delete delta.reasoning_details;
   const reasoning = visibleReasoning(delta);
   const content = typeof delta.content === 'string' ? delta.content : '';
 

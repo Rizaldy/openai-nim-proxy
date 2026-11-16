@@ -137,13 +137,13 @@ test('Numes model discovery uses its own provider', async () => {
   assert.equal(options.headers.Authorization, 'Bearer test');
 });
 
-test('Numes reasoning is displayed, with opaque details preserved', async () => {
+test('structured reasoning can be preserved explicitly for capable clients', async () => {
   const details = [{ type: 'reasoning.encrypted', data: 'opaque' }];
   const response = { status: 200, data: { choices: [{ message: {
     content: 'Answer', reasoning: 'Thought', reasoning_details: details
   } }] } };
   for (const show of ['true', 'false']) {
-    const { result } = await load({ NUMES_API_KEY: 'test', SHOW_REASONING: show }, response).request({}, numesRoute);
+    const { result } = await load({ NUMES_API_KEY: 'test', SHOW_REASONING: show, PRESERVE_REASONING_DETAILS: 'true' }, response).request({}, numesRoute);
     const message = result.choices[0].message;
     assert.equal(message.content, show === 'true' ? '<think>\nThought\n</think>\n\nAnswer' : 'Answer');
     assert.equal(message.reasoning, undefined);
@@ -181,4 +181,32 @@ test('NIM model discovery retains its key and aliases', async () => {
   assert.equal(options.headers.Authorization, 'Bearer test');
   assert.ok(result.data.some(model => model.id === 'nim/raw-model'));
   assert.ok(result.data.some(model => model.id === 'gpt-4o'));
+});
+
+
+test('Janitor responses expose reasoning only once, including when hidden', async () => {
+  const details = [{ type: 'reasoning.text', text: 'Thought' }];
+  for (const show of ['true', 'false']) {
+    const { context, request } = load({ SHOW_REASONING: show }, {
+      status: 200, data: { choices: [{ message: {
+        content: 'Answer', reasoning: 'Thought', reasoning_details: details
+      } }] }
+    });
+    const { result } = await request({});
+    assert.equal(result.choices[0].message.reasoning_details, undefined);
+    const deltas = vm.runInContext(`(() => {
+      const state = createStreamState();
+      return [
+        reasoningChunkToContent({ reasoning: 'The', reasoning_details: [{type:'reasoning.text',text:'The'}] }, state, 0),
+        reasoningChunkToContent({ reasoning: ' thought', reasoning_details: [{type:'reasoning.text',text:' thought'}] }, state, 0),
+        reasoningChunkToContent({ content: 'Answer' }, state, 0)
+      ];
+    })()`, context);
+    for (const delta of deltas) {
+      assert.equal(delta.reasoning, undefined);
+      assert.equal(delta.reasoning_content, undefined);
+      assert.equal(delta.reasoning_details, undefined);
+    }
+    assert.equal(deltas.map(d => d.content || '').join(''), show === 'true' ? '<think>\nThe thought\n</think>\n\nAnswer' : 'Answer');
+  }
 });
